@@ -1,5 +1,3 @@
-# CUDA_VISIBLE_DEVICES=$1 python3 qwen_inference_from_dump.py --preprocessed_dir ./embeddings \
-#                                 --output_file ./results/full_kv.json --model_path Qwen/${2}
 MODEL_PATH=Qwen/Qwen2.5-VL-${2}B-Instruct
 BLOCK_SIZE=$3
 COMPRESS_FRAME_NUM=$4

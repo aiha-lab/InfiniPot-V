@@ -204,7 +204,4 @@ def process_kv_cache(
             value_states[:, :, :system_size, :], new_value_states_to_compress
         ], dim=2)
     
-    # Update seen tokens count
-    # past_key_values._seen_tokens = system_size + compress_frame_num * token_per_frame
-    
     return past_key_values, None 
