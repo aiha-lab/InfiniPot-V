@@ -1,222 +1,44 @@
+"""
+Qwen2-VL Inference with Integrated Vision-LLM Block Processing
+
+This module integrates vision encoding and LLM block processing:
+- Instead of encoding all video frames at once, we process them block by block
+- Each block: Vision Tower (partial frames) -> Vision Tokens -> LLM Forward -> KV Compression
+"""
+
 import os
 import json
 import torch
-import torch.nn.functional as F
-import glob
 import time
-import re
-import uuid
-import numpy as np
 from tqdm import tqdm
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, Qwen2_5_VLForConditionalGeneration
 from transformers import DynamicCache
 from qwen_vl_utils import process_vision_info
-from datasets import load_dataset
-from decord import cpu, VideoReader
 import argparse
 
-# Import KV cache compression utilities
+# Import utilities
 from kvcache_utils import process_kv_cache
-
-class EvalDataset(torch.utils.data.IterableDataset):
-    """Dataset for supervised fine-tuning - adapted from eval_lvu_cache.py"""
-
-    video_formats = [".mp4", ".avi", ".mov", ".mkv"]
-
-    def __init__(
-        self,
-        data_path: str,
-        dataset: str,
-    ) -> None:
-        super(EvalDataset, self).__init__()
-
-        self.data_path = data_path
-        self.dataset = dataset
-
-        list_data_dict = []
-
-        if dataset == "videomme":
-            data_list = load_dataset("lmms-lab/Video-MME")
-            
-            for item in data_list:
-                video_ytid = item["url"].split("watch?v=")[-1]
-                video_path = os.path.join(self.data_path, "video", f"{video_ytid}.mp4")
-                for fmt in self.video_formats:
-                    temp_path = os.path.join(self.data_path, "video", f"{video_ytid}{fmt}")
-                    if os.path.exists(temp_path):
-                        video_path = temp_path
-                        break
-
-                subtitle_path = os.path.join(
-                    self.data_path, "subtitle", f"{video_ytid}.srt"
-                )
-                
-                list_data_dict.append(
-                    {
-                        "questions": item["question"],
-                        "video": video_path,
-                        "subtitle": subtitle_path,
-                        "video_name": video_ytid,
-                        "answer": item["answer"],
-                        "duration": item["duration"],
-                        "task_type": item["task_type"],
-                        "choices": item["options"],
-                    }
-                )
-
-        elif "mlvu" in dataset or "sample" in dataset:
-
-            json_name = "json" # Full
-
-            json_folder_path = os.path.join(data_path, json_name)
-            json_files = [f for f in os.listdir(json_folder_path) if f.endswith('.json')]
-            data_list = {}
-
-            for json_file in json_files:
-                task_name = re.sub(r'^\d+_(.+)\.json$', r'\1', json_file)            
-                # Create tuple with required format
-                data_tuple = (
-                    f"{json_name}/{json_file}",  # json file path
-                    f"video/{json_file.replace('.json', '')}", # video folder path
-                    "video"  # constant value
-                )
-                data_list[task_name] = data_tuple
-            
-            for k, v in data_list.items():
-                with open(os.path.join(data_path, v[0]), "r") as f:
-                    json_data = json.load(f)
-                for data in json_data:
-                    question, answer = self.qa_template(data)
-                    
-                    list_data_dict.append(
-                        {
-                            "task_type": k,
-                            "video": os.path.join(self.data_path, v[1], data["video"]),
-                            "video_name": data["video"],
-                            "questions": data["question"],
-                            "prompt": question,
-                            "answer": answer,
-                            "duration": data["duration"],
-                            "choices": data["candidates"]
-                        }
-                    )
-            
-        elif "lvb" in dataset:
-
-            json_name = "wo_subtitle"
-            
-            json_folder_path = os.path.join(data_path, json_name)
-            json_files = [f for f in os.listdir(json_folder_path) if f.endswith('.json')]
-            data_list = {}
-
-            for json_file in json_files:
-                task_name = re.sub(r'^\d+_(.+)\.json$', r'\1', json_file)            
-                # Create tuple with required format
-                data_tuple = (
-                    f"{json_name}/{json_file}",  # json file path
-                    f"video/{json_file.replace('.json', '')}", # video folder path
-                    "video"  # constant value
-                )
-                data_list[task_name] = data_tuple
-            
-            for k, v in data_list.items():
-                with open(os.path.join(data_path, v[0]), "r") as f:
-                    json_data = json.load(f)
-                for data in json_data:
-                    question, _ = self.qa_template(data, abcd=False)
-                    answer = data["answer"]
-                    
-                    list_data_dict.append(
-                        {
-                            "task_type": k[:-5],
-                            "video": os.path.join(self.data_path, v[-1], data["video"]),
-                            "video_name": data["video"],
-                            "questions": data["question"],
-                            "prompt": question,
-                            "answer": answer,
-                            "duration": data["duration"],
-                            "choices": data["candidates"]
-                        }
-                    )
-
-        elif dataset == "egoschema":
-            answer_list = json.load(open(os.path.join(data_path, "subset_answers.json"), "r"))
-            questions_list = json.load(open(os.path.join(data_path, "questions.json"), "r"))
-
-            questions_list_org = {}
-
-            for q in questions_list:
-                questions_list_org[q["q_uid"]] = q
-
-            for key, answer in answer_list.items():
-                data = questions_list_org[key]
-                
-                question = data["question"]
-                a0 = data["option 0"]
-                a1 = data["option 1"]
-                a2 = data["option 2"]
-                a3 = data["option 3"]
-                a4 = data["option 4"]
-                prompt = f"Question: {question}\nOptions:\n(A) {a0}\n(B) {a1}\n(C) {a2}\n(D) {a3}\n(E) {a4}\nRespond with only the letter (A, B, C, D or E) of the correct option."
-                options = f"0.{a0}, 1.{a1}, 2.{a2}, 3.{a3}, 4.{a4}"
-                
-                list_data_dict.append(
-                    {   
-                        "video": os.path.join(self.data_path, "video", f"{key}.mp4"),
-                        "video_name": key,
-                        "questions": question,
-                        "prompt": prompt,
-                        "answer": {0: 'A', 1: 'B', 2: 'C', 3: 'D', 4: 'E'}.get(answer),
-                        "choices": options,
-                        "duration": None,
-                        "task_type": None,
-                    }
-                )
-        else:
-            raise NotImplementedError("No dataset available (please choose {videomme, mlvu, egoschema, lvb})")
-        
-        self.data = list_data_dict
-    
-    def qa_template(self, data, abcd=True):
-        question = f"Question: {data['question']}\n"
-        question += "Options:\n"
-        answer = data["answer"]
-        answer_idx = -1
-        for idx, c in enumerate(data["candidates"]):
-            question += f"({chr(ord('A') + idx)}) {c}\n"
-            if c == answer:
-                answer_idx = idx
-        if abcd:
-            question += (
-                "Respond with only the letter (A, B, C or D) of the correct option.\n"
-            )
-        else:
-            question += (
-                "Please answer with the letter for the correct option.\n"
-            )
-        question = question.rstrip()
-        answer = f"{chr(ord('A') + answer_idx)}"
-        return question, answer
-
-    def __len__(self) -> int:
-        return len(self.data)
-
-    def __iter__(self):
-        return iter(self.data)
-
-    def __getitem__(self, i):
-        return self.data[i]
+from dataset_utils import EvalDataset, format_question, extract_answer, get_default_data_path
 
 
 class OfflineVideoEval:
     """
     Offline Video Understanding Evaluation
+    
+    Features:
+    - Vision encoding and LLM block processing are integrated
+    - Each block processes: raw pixels -> vision tower -> vision tokens -> LLM -> KV compression
     """
+    
+    # Class constants
+    MAX_GEN_TOKENS = 300
+    DEFAULT_EOS_TOKEN_ID = 151645
+    DEFAULT_MAX_PIXELS = 128 * 28 * 28
+    VIDEO_FORMATS = [".mp4", ".avi", ".mov", ".mkv"]
     
     def __init__(self, model_path, max_frames_num=32, block_size=-1, compress_frame_num=0, 
                  compression_method="uniform", tar_ratio=0.5, query_ratio=0.25, adaptive_pooling=False, 
-                 load_dumped=False, input_compression="none", per_frame=False, verbose=False
-                 ):
+                 load_dumped=False, per_frame=False, verbose=False):
         """
         Initialize OfflineVideoEval class for Qwen2VL inference on video benchmarks
         
@@ -230,7 +52,6 @@ class OfflineVideoEval:
             query_ratio: Ratio of query frames for tar method
             adaptive_pooling: Whether to use adaptive pooling
             load_dumped: Whether to load dumped preprocessed inputs if available
-            input_compression: Type of input compression ("none", "entropy", "similarity")
             per_frame: Whether to select complete frames (for val_norm method)
         """
         self.model_path = model_path
@@ -242,18 +63,10 @@ class OfflineVideoEval:
         self.query_ratio = query_ratio
         self.adaptive_pooling = adaptive_pooling
         self.load_dumped = load_dumped
-        self.input_compression = input_compression
         self.per_frame = per_frame
         self.model = None
         self.processor = None
         self.verbose = verbose
-        
-        # For entropy-based compression: store previous entropy scores
-        self.prev_entropy_scores = None
-        self.prev_vision_start_idx = None
-        
-        # For similarity-based compression: store previous vision embeddings
-        self.prev_vision_embeds = None
         
         # Initialize model
         self._initialize_model()
@@ -294,28 +107,64 @@ class OfflineVideoEval:
         Returns:
             EvalDataset instance
         """
-        # Set default data paths if not provided
         if data_path is None:
-            if "mlvu" in dataset_name:
-                #data_path = "/data/ms/hf_cache/MLVU"
-                data_path = "/video/MVLU/MLVU"
-                #data_path = "/workspace/InfiniPot-V/MLVU"
-            elif "ego" in dataset_name:
-                data_path = "/data/ms/hf_cache/egoschema"
-            elif "mme" in dataset_name:
-                data_path = "/data/ms/hf_cache/videomme"
-            elif "lvb" in dataset_name:
-                data_path = "/data/ms/hf_cache/longvideobench"
-            elif "sample" in dataset_name:
-                data_path = "sample"
-            else:
-                raise ValueError(f"Please provide data_path for dataset: {dataset_name}")
+            data_path = get_default_data_path(dataset_name)
         
         self._print(f"Loading dataset: {dataset_name} from {data_path}")
         dataset = EvalDataset(data_path=data_path, dataset=dataset_name)
         self._print(f"Dataset loaded: {len(dataset)} samples")
         
         return dataset
+    
+    def _get_dump_path(self, video_path):
+        """Generate dump path for preprocessed inputs"""
+        dump_path = video_path.replace("/MLVU/video/", "/MLVU/video_sampled_qwen_768/")
+        for fmt in self.VIDEO_FORMATS:
+            if dump_path.endswith(fmt):
+                return dump_path.replace(fmt, ".pt")
+        return dump_path + ".pt"
+    
+    def _load_or_process_video(self, messages, text, dump_path, is_first_sample):
+        """
+        Load preprocessed video inputs or process from scratch
+        
+        Returns:
+            Preprocessed inputs tensor
+        """
+        # Try loading cached inputs
+        if self.load_dumped and os.path.exists(dump_path):
+            if is_first_sample:
+                self._print("Loading dumped preprocessed inputs...")
+            start_time = time.time()
+            inputs = torch.load(dump_path).to(self.model.device)
+            if is_first_sample:
+                self._print(f"Loaded dumped inputs in {time.time() - start_time:.4f}s")
+            return inputs
+        
+        # Process video from scratch
+        if is_first_sample:
+            msg = "No dumped file found! Processing video..." if self.load_dumped else "Processing video from scratch..."
+            self._print(msg)
+        
+        _, video = process_vision_info(messages)
+        start_time = time.time()
+        inputs = self.processor(
+            text=[text],
+            images=None,
+            videos=video,
+            padding=True,
+            return_tensors="pt",
+        )
+        if is_first_sample:
+            self._print(f"Processed video in {time.time() - start_time:.4f}s")
+        
+        # Save for future use if enabled
+        if self.load_dumped:
+            inputs["pixel_values_videos"] = inputs["pixel_values_videos"].half()
+            os.makedirs(os.path.dirname(dump_path), exist_ok=True)
+            torch.save(inputs.to("cpu"), dump_path)
+        
+        return inputs.to(self.model.device)
     
     def prepare_video_input(self, video_path, question_text, is_first_sample=False):
         """
@@ -329,156 +178,34 @@ class OfflineVideoEval:
         Returns:
             Preprocessed inputs for the model
         """
-        
         # Prepare messages for video input
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "video",
-                        "video": video_path,
-                        "max_frames": self.max_frames_num,
-                        "max_pixels": 128*28*28,
-                    },
-                    {"type": "text", "text": question_text},
-                ],
-            }
-        ]
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "video", "video": video_path, "max_frames": self.max_frames_num, "max_pixels": self.DEFAULT_MAX_PIXELS},
+                {"type": "text", "text": question_text},
+            ],
+        }]
 
         # Apply chat template
-        text = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-
-        # Generate dump path for preprocessed inputs
-        # Handle different video formats
-        video_formats = [".mp4", ".avi", ".mov", ".mkv"]
-        dump_path = video_path.replace("/MLVU/video/", "/MLVU/video_sampled_qwen_768/")
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         
-        for fmt in video_formats:
-            if dump_path.endswith(fmt):
-                dump_path = dump_path.replace(fmt, ".pt")
-                break
-        
-        # Try to load dumped inputs if option is enabled
-        if self.load_dumped and os.path.exists(dump_path):
-            if is_first_sample:
-                self._print("Loading dumped preprocessed inputs...")
-            cur_time = time.time()
-            inputs = torch.load(dump_path)
-            inputs = inputs.to(self.model.device)
-            load_time = time.time() - cur_time
-            if is_first_sample:
-                self._print(f"Loaded dumped inputs in {load_time:.4f}s")
-        else:
-            if self.load_dumped and is_first_sample:
-                self._print("No dumped file found! Processing video...")
-            elif is_first_sample:
-                self._print("Processing video from scratch...")
-                
-            # Process vision info and prepare inputs
-            _, video = process_vision_info(messages)
-
-            cur_time = time.time()
-            inputs = self.processor(
-                text=[text],
-                images=None,
-                videos=video,
-                padding=True,
-                return_tensors="pt",
-            )
-            process_time = time.time() - cur_time
-            if is_first_sample:
-                self._print(f"Processed video in {process_time:.4f}s")
-            
-            input_ids = inputs["input_ids"]
-            if self.load_dumped:    
-                inputs["pixel_values_videos"] = inputs["pixel_values_videos"].half()
-                inputs = inputs.to("cpu")
-                os.makedirs(os.path.dirname(dump_path), exist_ok=True)
-                torch.save(inputs, dump_path)
-
-            inputs = inputs.to(self.model.device)
+        # Load or process video
+        dump_path = self._get_dump_path(video_path)
+        inputs = self._load_or_process_video(messages, text, dump_path, is_first_sample)
             
         # Prepare input_ids with video tokens
         input_ids = self.processor.tokenizer(text, return_tensors="pt").input_ids.to(self.model.device)
-        video_length = int(inputs["pixel_values_videos"].shape[0] // 4) # patch merger 
-        video_pad_tokens = torch.full((video_length,), self.model.config.video_token_id, dtype=torch.long).unsqueeze(0).to(self.model.device)
+        video_length = inputs["pixel_values_videos"].shape[0] // 4  # patch merger
+        video_pad_tokens = torch.full((video_length,), self.model.config.video_token_id, dtype=torch.long, device=self.model.device).unsqueeze(0)
+        
         vision_start_idx = (input_ids == self.model.config.vision_start_token_id).nonzero(as_tuple=True)[-1]
         vision_end_idx = (input_ids == self.model.config.vision_end_token_id).nonzero(as_tuple=True)[-1]
-        inputs["input_ids"] = torch.cat([input_ids[:,:vision_start_idx + 1], video_pad_tokens, input_ids[:,vision_end_idx:]], dim=-1)
-        inputs["attention_mask"] = torch.ones(inputs["input_ids"].shape).to(self.model.device)
+        
+        inputs["input_ids"] = torch.cat([input_ids[:, :vision_start_idx + 1], video_pad_tokens, input_ids[:, vision_end_idx:]], dim=-1)
+        inputs["attention_mask"] = torch.ones(inputs["input_ids"].shape, device=self.model.device)
         
         return inputs
-    
-    def format_question(self, data_item, dataset_name):
-        """
-        Format question based on dataset type
-        
-        Args:
-            data_item: Single data item from dataset
-            dataset_name: Name of the dataset
-            
-        Returns:
-            Formatted question string
-        """
-        if dataset_name == "videomme":
-            q = data_item["questions"]
-            ops = data_item["choices"]
-            instruct = f"Question: {q}\n"
-            instruct += "Options:\n"
-            for op in ops:
-                instruct += f"{op}\n"
-            instruct += (
-                "Respond with only the letter (A, B, C, or D) of the correct option.\n"
-            )
-            question_text = instruct.rstrip()
-            
-        elif "mlvu" in dataset_name or dataset_name == "egoschema" or "lvb" in dataset_name:
-            question_text = data_item["prompt"]
-        
-        elif "sample" in dataset_name:
-            question_text = data_item["questions"] + (" Respond with which option is the correct answer and explain why it is the correct answer.")
-        
-        else:
-            raise NotImplementedError(f"Question formatting not implemented for dataset: {dataset_name}")
-        
-        return question_text
-    
-    def extract_answer(self, response, dataset_name):
-        """
-        Extract answer from model response based on dataset format
-        
-        Args:
-            response: Raw model response
-            dataset_name: Name of the dataset
-            
-        Returns:
-            Extracted answer
-        """
-        response = response.replace("Answer", "")
-        
-        if "ego" in dataset_name or "lvb" in dataset_name:
-            letters = ["A", "B", "C", "D", "E"]
-            pred_answer = re.findall("[\(\ ]*[A-E][\)\ ]*", response)
-        else:
-            letters = ["A", "B", "C", "D"]
-            pred_answer = re.findall("[\(\ \[]*([A-D])[\)\.\ \]]*", response)
-        
-        if len(pred_answer) >= 1:
-            pred_answer = pred_answer[0].strip()
-            pred_answer = pred_answer.strip("()")
-            
-        if pred_answer in letters:
-            pred_idx = letters.index(pred_answer)
-            pred = letters[pred_idx]
-        else:
-            print(">>> No alphabet found!!!", "pred_answer: ", pred_answer, " response: ", response, flush=True)
-            pred_idx = 2  # Default to C
-            pred = letters[pred_idx]
-        
-        return pred
     
     def generate(self, inputs):
         """
@@ -491,7 +218,7 @@ class OfflineVideoEval:
             Generated response text
         """
         with torch.no_grad():
-            inputs.pop("second_per_grid_ts", None) ##qwen2 전용
+            inputs.pop("second_per_grid_ts", None) # for qwen2
             generated_ids = self.model.generate(**inputs, max_new_tokens=5)
             
             # Decode output (same as original code)
@@ -505,96 +232,142 @@ class OfflineVideoEval:
         
         return response
     
-    def _visual_encoding(self, inputs, input_ids, system_size, token_per_frame):
+    def _visual_encoding_block(self, pixel_values_videos, video_grid_thw, frame_start, frame_end, total_frames):
         """
-        Perform visual encoding and prepare inputs_embeds with position information
+        Perform visual encoding for a specific block of frames
+        
+        This function enables block-wise vision encoding.
+        Instead of encoding all frames at once, we encode only a subset of frames.
         
         Args:
-            inputs: Preprocessed inputs containing pixel_values_videos and video_grid_thw
-            input_ids: Input token IDs
-            system_size: Size of system tokens
-            token_per_frame: Number of tokens per frame
+            pixel_values_videos: Full pixel values tensor [total_patches, patch_dim]
+            video_grid_thw: Original video grid info [1, 3] = [frame_num, H, W]
+            frame_start: Starting frame index for this block
+            frame_end: Ending frame index for this block (exclusive)
+            total_frames: Total number of frames in the video
             
         Returns:
-            tuple: (inputs_embeds, position_ids_full)
+            video_embeds: Vision embeddings for this block of frames
         """
-        # Calculate position_ids_full and height_width
-        position_ids_full, _ = self.model.model.get_rope_index(input_ids, video_grid_thw=inputs["video_grid_thw"])
-        self.model.config.height_width = position_ids_full[1,:,system_size:system_size+token_per_frame].max() - position_ids_full[1,:,system_size:system_size+token_per_frame].min() + 1
+        # Calculate patches per frame
+        # pixel_values_videos shape: [total_patches, patch_dim]
+        # where total_patches = frame_num * H_patches * W_patches (before patch merger)
+        total_patches = pixel_values_videos.shape[0]
+        patches_per_frame = total_patches // total_frames
         
-        # Get token embeddings
-        inputs_embeds = self.model.model.get_input_embeddings()(input_ids)
-        pixel_values_videos = inputs["pixel_values_videos"].type(self.model.dtype)
+        # Extract pixel values for this block
+        patch_start = frame_start * patches_per_frame
+        patch_end = frame_end * patches_per_frame
+        block_pixel_values = pixel_values_videos[patch_start:patch_end]
         
-        # Visual Encoding
+        # Create block-specific video_grid_thw
+        block_frame_num = frame_end - frame_start
+        block_video_grid_thw = video_grid_thw.clone()
+        block_video_grid_thw[0, 0] = block_frame_num  # Update frame count
+        
+        # Convert to model dtype
+        block_pixel_values = block_pixel_values.type(self.model.dtype)
+        
+        # Run vision tower on this block
         with torch.inference_mode():
             video_embeds = self.model.get_video_features(
-                pixel_values_videos,
-                video_grid_thw=inputs["video_grid_thw"]
+                block_pixel_values,
+                video_grid_thw=block_video_grid_thw
             )
-            video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            # get_video_features returns a list, concatenate
+            video_embeds = torch.cat(video_embeds, dim=0)
         
-        # Replace video tokens with visual embeddings
-        video_mask = input_ids == self.model.config.video_token_id
-        inputs_embeds[video_mask] = video_embeds
-        
-        return inputs_embeds, position_ids_full
+        return video_embeds
     
-    def _block_wise_prefill(self, inputs, input_ids, position_ids_full, past_key_values, system_size, inst_size, token_per_frame, vision_length):
+    def _block_wise_prefill(self, inputs, input_ids, past_key_values, system_size, inst_size, 
+                             token_per_frame, vision_length, total_frames):
         """
-        Perform block-wise prefill processing
+        Perform block-wise prefill with integrated vision encoding
+        
+        Features:
+        - Vision encoding happens within the block loop
+        - Each iteration: extract frame pixels -> vision tower -> LLM forward -> KV compression
         
         Args:
             inputs: Original inputs containing pixel_values_videos and video_grid_thw
             input_ids: Input token IDs
-            position_ids_full: Full position IDs
             past_key_values: KV cache to update
             system_size: Size of system tokens
             inst_size: Size of instruction tokens
-            token_per_frame: Number of tokens per frame
+            token_per_frame: Number of tokens per frame (after patch merger)
             vision_length: Total vision token length
+            total_frames: Total number of frames in the video
             
         Returns:
-            Updated past_key_values after prefill
+            tuple: (past_key_values, position_ids_full) - Updated KV cache and position IDs for generation
         """
-        past_seen_tokens = 0
-        cur_pos = system_size
+        cur_frame = 0  # Track by frame index instead of token position
         
-        # Get full inputs_embeds with visual encoding first
-        inputs_embeds, _ = self._visual_encoding(inputs, input_ids, system_size, token_per_frame)
+        # Get system token embeddings (these are text embeddings, processed once)
+        system_input_ids = input_ids[:, :system_size]
+        system_embeds = self.model.model.get_input_embeddings()(system_input_ids)
         
-        while cur_pos < vision_length:
-            start_idx = cur_pos
+        # Get pixel values and grid info
+        pixel_values_videos = inputs["pixel_values_videos"]
+        video_grid_thw = inputs["video_grid_thw"]
+        
+        # Calculate position_ids for the full sequence (needed for 3D RoPE)
+        position_ids_full, _ = self.model.model.get_rope_index(input_ids, video_grid_thw=video_grid_thw)
+        
+        # Store height_width for KV cache compression
+        self.model.config.height_width = (
+            position_ids_full[1, :, system_size:system_size + token_per_frame].max() - 
+            position_ids_full[1, :, system_size:system_size + token_per_frame].min() + 1
+        )
+        
+        # Calculate how many frames to process per block
+        # Considering compression: actual new frames = block_size - compress_frame_num (except first block)
+        
+        while cur_frame < total_frames:
+            # Calculate frame range for this block
+            frame_start = cur_frame
             
-            # Calculate visual cache length (for compression)
-            vis_cache_length = (self.compress_frame_num * token_per_frame) if start_idx > system_size else 0
-            end_idx = cur_pos + self.block_size * token_per_frame - vis_cache_length
+            # Calculate how many frames can be processed in this block
+            # For first block: full block_size frames
+            # For subsequent blocks: block_size - compress_frame_num (since compress_frame_num frames are cached)
+            if frame_start == 0:
+                frames_in_block = min(self.block_size, total_frames)
+            else:
+                # Account for compressed frames in cache
+                vis_cache_frames = self.compress_frame_num
+                frames_in_block = min(self.block_size - vis_cache_frames, total_frames - frame_start)
+            
+            frame_end = frame_start + frames_in_block
             
             # Determine block type
-            is_first_block = start_idx == system_size
-            is_last_block = True if (end_idx - system_size) >= vision_length else False
+            is_first_block = (frame_start == 0)
+            is_last_block = (frame_end >= total_frames)
             
-            # Prepare block inputs and extract video embeddings for similarity calculation
+            # Step 1: Vision encoding for this block of frames
+            block_video_embeds = self._visual_encoding_block(
+                pixel_values_videos, video_grid_thw, 
+                frame_start, frame_end, total_frames
+            )
+            block_video_embeds = block_video_embeds.to(system_embeds.device, system_embeds.dtype)
+            
+            # Step 2: Prepare inputs_embeds for this block
             if is_first_block:
-                # First block: include system tokens + vision tokens
-                block_inputs_embeds = inputs_embeds[:, :end_idx]
-                position_ids = position_ids_full[:, :, :end_idx]
-                # For similarity calculation: exclude system tokens
-                current_video_embeds = inputs_embeds[:, system_size:end_idx]
-            elif is_last_block:
-                # Last block: vision tokens (instruction will be added in generation stage)
-                block_inputs_embeds = inputs_embeds[:, start_idx:system_size + vision_length]
-                position_ids = position_ids_full[:, :, start_idx:system_size + vision_length]
-                # For similarity calculation: all tokens are video tokens
-                current_video_embeds = inputs_embeds[:, start_idx:system_size + vision_length]
+                # First block: system tokens + vision tokens
+                block_inputs_embeds = torch.cat([system_embeds, block_video_embeds.unsqueeze(0)], dim=1)
+                # Calculate token range for position_ids
+                token_start = 0
+                token_end = system_size + frames_in_block * token_per_frame
             else:
-                # Middle block: only vision tokens
-                block_inputs_embeds = inputs_embeds[:, start_idx:end_idx]
-                position_ids = position_ids_full[:, :, start_idx:end_idx]
-                # For similarity calculation: all tokens are video tokens
-                current_video_embeds = inputs_embeds[:, start_idx:end_idx]
+                # Subsequent blocks: only vision tokens (system tokens are in cache)
+                block_inputs_embeds = block_video_embeds.unsqueeze(0)
+                # Token range for position_ids
+                token_start = system_size + frame_start * token_per_frame
+                token_end = system_size + frame_end * token_per_frame
             
-            # Run model on current block
+            # Get position_ids for this block from the full position_ids
+            position_ids = position_ids_full[:, :, token_start:token_end]
+            
+            # Step 3: LLM forward for this block
             with torch.inference_mode():
                 outputs = self.model(
                     position_ids=position_ids,
@@ -603,24 +376,21 @@ class OfflineVideoEval:
                     use_cache=True
                 )
             
-            # Update cache and counters
+            # Update cache
             past_key_values = outputs[1]
-            past_seen_tokens += block_inputs_embeds.shape[1]
             
-            # KV cache compression for non-last blocks
+            # Step 4: KV cache compression for non-last blocks
             if not is_last_block:
-                # DynamicBP - Dynamic compression frame calculation
-                assert (vision_length - (past_seen_tokens - system_size)) % token_per_frame == 0, "left length should be divided by token_per_frame number."
-
-                res_frame_num = (vision_length - (past_seen_tokens - system_size)) // token_per_frame
+                # Calculate remaining frames
+                res_frame_num = total_frames - frame_end
                 
-                
+                # Dynamic compression frame calculation
                 if (self.compress_frame_num + res_frame_num) >= self.block_size:
                     compress_frame_num = self.compress_frame_num
                 else:
                     compress_frame_num = self.block_size - res_frame_num
                 
-                # Use traditional KV cache compression
+                # Apply KV cache compression
                 past_key_values, _ = process_kv_cache(
                     past_key_values=past_key_values,
                     model=self.model,
@@ -638,11 +408,12 @@ class OfflineVideoEval:
                 )
             
             # Move to next block
-            cur_pos = end_idx
+            cur_frame = frame_end
         
-        return past_key_values
+        # Return the last position for generation stage
+        return past_key_values, position_ids_full
     
-    def _generation_stage(self, inputs, past_key_values, position_ids_full, inst_size):
+    def _generation_stage(self, inputs, past_key_values, position_ids_full):
         """
         Generation stage: generate tokens autoregressively after prefill
         
@@ -650,18 +421,16 @@ class OfflineVideoEval:
             inputs: Original inputs (to get instruction tokens)
             past_key_values: KV cache after prefill
             position_ids_full: Position IDs from prefill
-            inst_size: Size of instruction tokens
             
         Returns:
             Generated response text
         """
-        # Get instruction tokens
         input_ids = inputs["input_ids"]
         video_token_id = self.model.config.video_token_id
-        mask_indices = (input_ids[0,:] == video_token_id).nonzero(as_tuple=True)[0]
+        mask_indices = (input_ids[0, :] == video_token_id).nonzero(as_tuple=True)[0]
         
         # Extract instruction part after vision tokens
-        inst_start = mask_indices[-1] + 1  # after vision_end token
+        inst_start = mask_indices[-1] + 1
         post_input_ids = input_ids[:, inst_start:]
         input_len = post_input_ids.shape[-1]
         
@@ -671,52 +440,36 @@ class OfflineVideoEval:
         
         # Calculate 3D position ids starting from prefill end
         position_ids = torch.arange(input_len, device=input_ids_current.device).expand(input_ids_current.shape[0], -1)
-        position_ids = position_ids.add(position_ids_full[0, 0, -1]) + 1
-        position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+        position_ids = (position_ids + position_ids_full[0, 0, -1] + 1).unsqueeze(0).expand(3, -1, -1)
+        
+        # Get EOS token ID once
+        eos_token_id = getattr(self.processor.tokenizer, 'eos_token_id', self.DEFAULT_EOS_TOKEN_ID)
         
         # Generation loop
-        generation_finished = False
-        max_gen_tokens = 300  # Prevent infinite loop
-        gen_token_count = 0
-        
-        while not generation_finished and gen_token_count < max_gen_tokens:
+        for _ in range(self.MAX_GEN_TOKENS):
             with torch.no_grad():
-                outputs = self.model(
-                    input_ids_current, 
-                    past_key_values=past_key_values, 
-                    position_ids=position_ids
-                )
+                outputs = self.model(input_ids_current, past_key_values=past_key_values, position_ids=position_ids)
             
-            final_logits = outputs[0]
             past_key_values = outputs[1]
-            next_token = final_logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+            next_token = outputs[0][:, -1, :].argmax(dim=-1).unsqueeze(1)
             
-            # Update sequences
             input_ids_save = torch.cat([input_ids_save, next_token], dim=-1)
             input_ids_current = next_token
             position_ids = position_ids[:, :, -1:] + 1
-            gen_token_count += 1
-            
-            # Check for EOS token
-            if hasattr(self.processor.tokenizer, 'eos_token_id'):
-                eos_token_id = self.processor.tokenizer.eos_token_id
-            else:
-                eos_token_id = 151645  # fallback
             
             if next_token[0, -1] == eos_token_id:
-                generation_finished = True
+                break
         
-        # Extract generated part (excluding instruction)
+        # Decode generated tokens (excluding instruction)
         output_ids = input_ids_save[:, input_len:]
-        
-        # Decode generated tokens
-        response = self.processor.tokenizer.decode(output_ids[0], skip_special_tokens=True, clean_up_tokenization_spaces=False)
-        
-        return response
+        return self.processor.tokenizer.decode(output_ids[0], skip_special_tokens=True, clean_up_tokenization_spaces=False)
     
     def block_process(self, inputs):
         """
-        Block processing approach with prefill and generation stages
+        Block processing approach with integrated vision-LLM processing
+        
+        This is the main entry point for block processing.
+        Vision encoding happens inside the block loop.
         
         Args:
             inputs: Preprocessed inputs
@@ -724,44 +477,108 @@ class OfflineVideoEval:
         Returns:
             Generated response text
         """
-        # Reset compression caches for new video
-        if self.input_compression == "entropy":
-            self.prev_entropy_scores = None
-            self.prev_vision_start_idx = None
-        elif self.input_compression == "similarity":
-            self.prev_vision_embeds = None
-        
         # Extract video tokens and calculate dimensions
         input_ids = inputs["input_ids"]
         video_token_id = self.model.config.video_token_id
-        frame_number = inputs["video_grid_thw"][0,0]
+        frame_number = inputs["video_grid_thw"][0, 0].item()
         
         # Calculate token positions and dimensions
-        mask_indices = (input_ids[0,:] == video_token_id).nonzero(as_tuple=True)[0]
-        system_size = input_ids[0,:mask_indices[0] - 1].shape[-1] + 1 # vision_start
-        inst_size = input_ids[0,mask_indices[-1] + 2:].shape[-1] + 1 # including vision end token
+        mask_indices = (input_ids[0, :] == video_token_id).nonzero(as_tuple=True)[0]
+        system_size = input_ids[0, :mask_indices[0] - 1].shape[-1] + 1  # vision_start
+        inst_size = input_ids[0, mask_indices[-1] + 2:].shape[-1] + 1  # including vision end token
         token_per_frame = int((input_ids == video_token_id).sum() // frame_number)
         
-        # Initialize past_key_values for caching
-        past_key_values = DynamicCache()
-        
-        # Calculate position_ids_full
-        position_ids_full, _ = self.model.model.get_rope_index(input_ids, video_grid_thw=inputs["video_grid_thw"])
-        self.model.config.height_width = position_ids_full[1,:,system_size:system_size+token_per_frame].max() - position_ids_full[1,:,system_size:system_size+token_per_frame].min() + 1
+        # Calculate video-related dimensions
+        total_frames = frame_number
         
         token_length = input_ids.shape[1]
         vision_length = token_length - system_size - inst_size
         
-        # Step 1: Block-wise Prefill
-        past_key_values = self._block_wise_prefill(
-            inputs, input_ids, position_ids_full, past_key_values,
-            system_size, inst_size, token_per_frame, vision_length
+        # Initialize past_key_values for caching
+        past_key_values = DynamicCache()
+        
+        self._print(f"Block Processing: {total_frames} frames, {token_per_frame} tokens/frame")
+        self._print(f"Block size: {self.block_size}, Compress frames: {self.compress_frame_num}")
+        
+        # Step 1: Block-wise Prefill with integrated vision encoding
+        past_key_values, position_ids_full = self._block_wise_prefill(
+            inputs, input_ids, past_key_values,
+            system_size, inst_size, token_per_frame, vision_length,
+            total_frames
         )
         
         # Step 2: Generation Stage
-        response = self._generation_stage(inputs, past_key_values, position_ids_full, inst_size)
+        response = self._generation_stage(inputs, past_key_values, position_ids_full)
         
         return response
+    
+    def _compute_accuracy(self, stats_dict):
+        """Compute accuracy from stats dict with correct/total counts"""
+        return {k: v["correct"] / v["total"] if v["total"] > 0 else 0 for k, v in stats_dict.items()}
+    
+    def _create_summary(self, stats_dict):
+        """Create detailed summary with accuracy, counts, and percentage"""
+        return {
+            k: {
+                "accuracy": v["correct"] / v["total"] if v["total"] > 0 else 0.0,
+                "correct": v["correct"],
+                "total": v["total"],
+                "percentage": f"{v['correct'] / v['total'] * 100:.2f}%" if v["total"] > 0 else "0.00%"
+            }
+            for k, v in stats_dict.items()
+        }
+    
+    def _save_results(self, final_results, dataset_name, output_dir, exp_tag):
+        """Save evaluation results to JSON files"""
+        output_path = os.path.join(output_dir, self.model_path.split("/")[-1], exp_tag)
+        os.makedirs(output_path, exist_ok=True)
+        
+        # Save detailed results
+        with open(os.path.join(output_path, "results.json"), 'w') as f:
+            json.dump(final_results, f, indent=2)
+        
+        # Save simple accuracy results (compatible format)
+        stats = final_results["accuracy_statistics"]
+        if dataset_name == "videomme":
+            simple_results = {"average_acc": stats["overall_accuracy"], **stats.get("duration_accuracy", {})}
+        elif "mlvu" in dataset_name or "lvb" in dataset_name:
+            task_acc = stats["task_type_accuracy"]
+            simple_results = {**task_acc, "Acc": sum(task_acc.values()) / len(task_acc) if task_acc else 0}
+        else:
+            simple_results = {"acc": stats["overall_accuracy"]}
+        
+        with open(os.path.join(output_path, "accuracy.json"), 'w') as f:
+            json.dump(simple_results, f, indent=2)
+        
+        return output_path
+    
+    def _print_summary(self, final_results, dataset_name, output_path, last_question=None, last_response=None):
+        """Print evaluation summary"""
+        stats = final_results["accuracy_statistics"]
+        
+        if dataset_name == "sample":
+            print(f"\n=== Sample Generation Results ===")
+            print(f">>> QUESTION: {last_question}")
+            print(f">>> RESPONSE: {last_response}")
+            return
+        
+        print(f"\n=== EVALUATION SUMMARY ===")
+        print(f"Dataset: {dataset_name}")
+        print(f"Overall Accuracy: {stats['overall_accuracy']:.4f} ({stats['total_correct']}/{stats['total_questions']})")
+        
+        if stats["task_type_accuracy"]:
+            print(f"\nAccuracy by Task Type:")
+            for task_type, acc in stats["task_type_accuracy"].items():
+                details = stats["task_type_details"][task_type]
+                print(f"  {task_type}: {acc:.4f} ({details['correct']}/{details['total']})")
+        
+        if dataset_name == "videomme" and stats.get("duration_accuracy"):
+            print(f"\nAccuracy by Duration:")
+            for duration, acc in stats["duration_accuracy"].items():
+                details = stats["duration_details"][duration]
+                print(f"  {duration}: {acc:.4f} ({details['correct']}/{details['total']})")
+        
+        print(f"\nResults saved to: {output_path}")
     
     def evaluate_dataset(self, dataset, dataset_name, output_dir, exp_tag):
         """
@@ -779,73 +596,43 @@ class OfflineVideoEval:
         results = []
         correct_count = 0
         total_count = 0
-        
-        # Task-specific accuracy tracking
         task_type_stats = {}
         duration_stats = {"short": {"correct": 0, "total": 0}, 
                          "medium": {"correct": 0, "total": 0}, 
                          "long": {"correct": 0, "total": 0}}
+        last_question, last_response = None, None
         
         print(f"Starting evaluation on {dataset_name} with {len(dataset)} samples...")
 
         for idx, data_item in enumerate(tqdm(dataset, desc=f"Evaluating {dataset_name}", dynamic_ncols=True)):
-            video_path = data_item["video"]
-            video_name = data_item["video_name"]
-            
-            # For now, decode every video (can be optimized later for VideoMME)
-            do_decode = True
-            
-            # # Skip if video file doesn't exist
-            # if not os.path.exists(video_path):
-            #     print(f"Warning: Video file not found: {video_path}")
-            #     continue
-            
-            # Format question based on dataset
-            question_text = self.format_question(data_item, dataset_name)
-            
-            # Prepare video input
             is_first_sample = (idx == 0)
-            try:
-                inputs = self.prepare_video_input(video_path, question_text, is_first_sample)
+            question_text = format_question(data_item, dataset_name)
+            inputs = self.prepare_video_input(data_item["video"], question_text, is_first_sample)
 
-            except Exception as e:
-                print(f"Error preparing video input: {e}")
-                continue
-            
-            # Choose inference method based on settings
+            # Choose and run inference method
             start_time = time.time()
-            frame_count = inputs["video_grid_thw"][0,0].item()
+            frame_count = inputs["video_grid_thw"][0, 0].item()
             use_block_processing = (self.block_size > 0 and frame_count > self.block_size and 
-                                    (self.compress_frame_num > 0 or self.input_compression != "none"))
+                                    self.compress_frame_num > 0)
             
             if is_first_sample:
                 print(f"Frame count: {frame_count}, Block size: {self.block_size}, Compress frames: {self.compress_frame_num}")
                 print(f"Using {'Block Processing' if use_block_processing else 'Standard Generation'}")
-                if use_block_processing and self.compress_frame_num > 0:
-                    compression_display = {
-                        "none": self.compression_method,
-                        "entropy": "Entropy-based",
-                        "similarity": "Similarity-based"
-                    }
-                    print(f"Compression method: {compression_display[self.input_compression]}")
             
-            if use_block_processing:
-                response = self.block_process(inputs)
-            else:
-                response = self.generate(inputs)
+            response = self.block_process(inputs) if use_block_processing else self.generate(inputs)
             inference_time = time.time() - start_time
+            last_question, last_response = question_text, response
             
-            # Extract answer from response
-            pred_answer = self.extract_answer(response, dataset_name)
+            # Evaluate result
+            pred_answer = extract_answer(response, dataset_name)
             ground_truth = data_item["answer"]
-            
-            # Check correctness
             is_correct = pred_answer == ground_truth
+            
             if is_correct:
                 correct_count += 1
             total_count += 1
             
-            # Track task-specific accuracy
+            # Update task stats
             task_type = data_item.get("task_type", "unknown")
             if task_type not in task_type_stats:
                 task_type_stats[task_type] = {"correct": 0, "total": 0}
@@ -853,7 +640,7 @@ class OfflineVideoEval:
             if is_correct:
                 task_type_stats[task_type]["correct"] += 1
             
-            # Track duration-specific accuracy (for VideoMME)
+            # Update duration stats (VideoMME)
             if dataset_name == "videomme" and "duration" in data_item:
                 duration = data_item["duration"]
                 if duration in duration_stats:
@@ -863,7 +650,7 @@ class OfflineVideoEval:
             
             # Store result
             result = {
-                "video_name": video_name,
+                "video_name": data_item["video_name"],
                 "question": data_item["questions"],
                 "ground_truth": ground_truth,
                 "predicted_answer": pred_answer,
@@ -871,45 +658,20 @@ class OfflineVideoEval:
                 "is_correct": is_correct,
                 "task_type": task_type,
                 "inference_time": inference_time,
-                "video_path": video_path
+                "video_path": data_item["video"]
             }
-            
             if dataset_name == "videomme":
                 result["duration"] = data_item.get("duration")
                 result["choices"] = data_item.get("choices")
-            
             results.append(result)
             
-            # Clear GPU cache periodically
             if idx % 100 == 0:
                 torch.cuda.empty_cache()
-                
         
-        # Calculate accuracy statistics
+        # Build final results
         overall_accuracy = correct_count / total_count if total_count > 0 else 0
+        task_accuracy = self._compute_accuracy(task_type_stats)
         
-        # Task-specific accuracy
-        task_accuracy = {}
-        for task_type, stats in task_type_stats.items():
-            task_accuracy[task_type] = stats["correct"] / stats["total"] if stats["total"] > 0 else 0
-        
-        # Duration-specific accuracy (for VideoMME)
-        duration_accuracy = {}
-        if dataset_name == "videomme":
-            for duration, stats in duration_stats.items():
-                duration_accuracy[duration] = stats["correct"] / stats["total"] if stats["total"] > 0 else 0
-        
-        # Prepare type-wise accuracy summary
-        type_wise_accuracy = {}
-        for task_type, stats in task_type_stats.items():
-            type_wise_accuracy[task_type] = {
-                "accuracy": stats["correct"] / stats["total"] if stats["total"] > 0 else 0.0,
-                "correct": stats["correct"],
-                "total": stats["total"],
-                "percentage": f"{(stats['correct'] / stats['total'] * 100):.2f}%" if stats["total"] > 0 else "0.00%"
-            }
-        
-        # Prepare final results
         final_results = {
             "results": results,
             "accuracy_statistics": {
@@ -918,7 +680,7 @@ class OfflineVideoEval:
                 "total_correct": correct_count,
                 "task_type_accuracy": task_accuracy,
                 "task_type_details": task_type_stats,
-                "type_wise_summary": type_wise_accuracy
+                "type_wise_summary": self._create_summary(task_type_stats)
             },
             "experiment_config": {
                 "dataset": dataset_name,
@@ -928,72 +690,18 @@ class OfflineVideoEval:
                 "compress_frame_num": self.compress_frame_num,
                 "compression_method": self.compression_method,
                 "load_dumped": self.load_dumped,
-                "input_compression": self.input_compression,
                 "per_frame": self.per_frame
             }
         }
         
         if dataset_name == "videomme":
-            final_results["accuracy_statistics"]["duration_accuracy"] = duration_accuracy
+            final_results["accuracy_statistics"]["duration_accuracy"] = self._compute_accuracy(duration_stats)
             final_results["accuracy_statistics"]["duration_details"] = duration_stats
-            
-            # Add duration-wise summary for VideoMME
-            duration_wise_summary = {}
-            for duration, stats in duration_stats.items():
-                duration_wise_summary[duration] = {
-                    "accuracy": stats["correct"] / stats["total"] if stats["total"] > 0 else 0.0,
-                    "correct": stats["correct"],
-                    "total": stats["total"],
-                    "percentage": f"{(stats['correct'] / stats['total'] * 100):.2f}%" if stats["total"] > 0 else "0.00%"
-                }
-            final_results["accuracy_statistics"]["duration_wise_summary"] = duration_wise_summary
+            final_results["accuracy_statistics"]["duration_wise_summary"] = self._create_summary(duration_stats)
         
-        # Save results
-        output_path = os.path.join(output_dir, self.model_path.split("/")[-1], exp_tag)
-        os.makedirs(output_path, exist_ok=True)
-        
-        # Save detailed results
-        with open(os.path.join(output_path, "results.json"), 'w') as f:
-            json.dump(final_results, f, indent=2)
-        
-        # Save simple accuracy results (compatible with eval_lvu_cache.py format)
-        if dataset_name == "videomme":
-            simple_results = {
-                "average_acc": overall_accuracy,
-                **duration_accuracy
-            }
-        elif "mlvu" in dataset_name or "lvb" in dataset_name:
-            simple_results = {task_type: acc for task_type, acc in task_accuracy.items()}
-            simple_results["Acc"] = sum(task_accuracy.values()) / len(task_accuracy) if task_accuracy else 0
-        else:  # egoschema
-            simple_results = {"acc": overall_accuracy}
-        
-        with open(os.path.join(output_path, "accuracy.json"), 'w') as f:
-            json.dump(simple_results, f, indent=2)
-        
-        # Print summary
-        if dataset_name == "sample":
-            print(f"\n=== Sample Generation Results ===")
-            print(f">>> QUESTION: {question_text}")
-            print(f">>> RESPONSE: {response}")
-        else:
-            print(f"\n=== EVALUATION SUMMARY ===")
-            print(f"Dataset: {dataset_name}")
-            print(f"Overall Accuracy: {overall_accuracy:.4f} ({correct_count}/{total_count})")
-            
-            if task_accuracy:
-                print(f"\nAccuracy by Task Type:")
-                for task_type, acc in task_accuracy.items():
-                    stats = task_type_stats[task_type]
-                    print(f"  {task_type}: {acc:.4f} ({stats['correct']}/{stats['total']})")
-            
-            if dataset_name == "videomme" and duration_accuracy:
-                print(f"\nAccuracy by Duration:")
-                for duration, acc in duration_accuracy.items():
-                    stats = duration_stats[duration]
-                    print(f"  {duration}: {acc:.4f} ({stats['correct']}/{stats['total']})")
-        
-            print(f"\nResults saved to: {output_path}")
+        # Save and print results
+        output_path = self._save_results(final_results, dataset_name, output_dir, exp_tag)
+        self._print_summary(final_results, dataset_name, output_path, last_question, last_response)
         
         return final_results
 
@@ -1033,9 +741,6 @@ def main():
                         help="Ratio of query frames for tar method")
     parser.add_argument("--adaptive_pooling", action="store_true",
                         help="Use adaptive pooling for KV cache compression")
-    parser.add_argument("--input_compression", type=str, default="none",
-                        choices=["none", "entropy", "similarity"],
-                        help="Type of input compression: none (traditional), entropy, or similarity")
     parser.add_argument("--per_frame", action="store_true",
                         help="Select complete frames instead of individual tokens (for val_norm method)")
     parser.add_argument("--verbose", action="store_true",
@@ -1053,9 +758,8 @@ def main():
         query_ratio=args.query_ratio,
         adaptive_pooling=args.adaptive_pooling,
         load_dumped=args.load_dumped,
-        input_compression=args.input_compression,
         per_frame=args.per_frame,
-        verbose = args.verbose
+        verbose=args.verbose
     )
     
     # Load dataset
@@ -1070,12 +774,7 @@ def main():
         if args.use_block_processing:
             print(f"Block size: {args.block_size}")
             print(f"Compress frames: {args.compress_frame_num}")
-            compression_display = {
-                "none": args.compression_method,
-                "entropy": "Entropy-based",
-                "similarity": "Similarity-based"
-            }
-            print(f"Compression method: {compression_display[args.input_compression]}")
+            print(f"Compression method: {args.compression_method}")
         print(f"\n=== Starting Evaluation ===")
     
     # Run evaluation
@@ -1093,4 +792,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()
