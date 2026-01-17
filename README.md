@@ -40,6 +40,24 @@ Supported Models: Qwen2-VL, Qwen2.5-VL series
     to enter a room and immediately start causing damage and taking items, especially in a 
     public setting like a bank.
 
+---
+
+## Evaluation
+
+```bash
+# bash scripts/run_ovu.sh [GPU_ID] [MODEL_SIZE] [BLOCK_SIZE] [COMPRESS_FRAMES] [METHOD] [DATASET] [VIDEO MAX_FRAMES]
+bash scripts/run_ovu.sh 0 7 32 24 infinipot-v mlvu 768
+```
+
+### Supported Long Video Understanding Benchmarks
+| Benchmark | Description |
+|-----------|-------------|
+| `mlvu` | [MLVU](https://github.com/JUNJIE99/MLVU) - Multi-task Long Video Understanding |
+| `videomme` | [Video-MME](https://video-mme.github.io/) - Video Multi-Modal Evaluation |
+| `lvb` | [LongVideoBench](https://longvideobench.github.io/) |
+| `egoschema` | [EgoSchema](https://egoschema.github.io/) - Egocentric Video QA |
+
+Please download videos from each benchmark's official website and organize them according to the dataset structure. For faster evaluation, use the `--load_dumped` option to load pre-dumped pre-processed video pixel values.
 
 ---
 
