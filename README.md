@@ -54,7 +54,7 @@ bash scripts/run_ovu.sh 0 7 32 24 infinipot-v mlvu 768
 |-----------|-------------|
 | `mlvu` | [MLVU](https://github.com/JUNJIE99/MLVU) - Multi-task Long Video Understanding |
 | `videomme` | [Video-MME](https://video-mme.github.io/) - Video Multi-Modal Evaluation |
-| `lvb` | [LongVideoBench](https://longvideobench.github.io/) |
+| `lvb` | [LongVideoBench](https://longvideobench.github.io/) - Long-context Interleaved Video-Language Understanding |
 | `egoschema` | [EgoSchema](https://egoschema.github.io/) - Egocentric Video QA |
 
 Please download videos from each benchmark's official website and organize them according to the dataset structure. For faster evaluation, use the `--load_dumped` option to load pre-dumped pre-processed video pixel values.
