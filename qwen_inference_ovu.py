@@ -64,7 +64,7 @@ class EvalDataset(torch.utils.data.IterableDataset):
                     }
                 )
 
-        elif "mlvu" in dataset:
+        elif "mlvu" in dataset or "sample" in dataset:
 
             json_name = "json" # Full
 
@@ -176,7 +176,7 @@ class EvalDataset(torch.utils.data.IterableDataset):
             raise NotImplementedError("No dataset available (please choose {videomme, mlvu, egoschema, lvb})")
         
         self.data = list_data_dict
-
+    
     def qa_template(self, data, abcd=True):
         question = f"Question: {data['question']}\n"
         question += "Options:\n"
@@ -215,7 +215,8 @@ class OfflineVideoEval:
     
     def __init__(self, model_path, max_frames_num=32, block_size=-1, compress_frame_num=0, 
                  compression_method="uniform", tar_ratio=0.5, query_ratio=0.25, adaptive_pooling=False, 
-                 load_dumped=False, input_compression="none", per_frame=False):
+                 load_dumped=False, input_compression="none", per_frame=False, verbose=False
+                 ):
         """
         Initialize OfflineVideoEval class for Qwen2VL inference on video benchmarks
         
@@ -245,6 +246,7 @@ class OfflineVideoEval:
         self.per_frame = per_frame
         self.model = None
         self.processor = None
+        self.verbose = verbose
         
         # For entropy-based compression: store previous entropy scores
         self.prev_entropy_scores = None
@@ -256,9 +258,13 @@ class OfflineVideoEval:
         # Initialize model
         self._initialize_model()
     
+    def _print(self, message):
+        if self.verbose:
+            print(f">>> {message}", flush=True)
+
     def _initialize_model(self):
         """Initialize the Qwen2VL model and processor"""
-        print("Loading Qwen2VL model...")
+        self._print("Loading Qwen2VL model...")
         if "2.5-vl" in self.model_path.lower():
             self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 self.model_path, 
@@ -275,7 +281,7 @@ class OfflineVideoEval:
             )
         
         self.processor = AutoProcessor.from_pretrained(self.model_path)
-        print("Model loaded successfully!")
+        self._print("Model loaded successfully!")
     
     def load_dataset(self, dataset_name, data_path):
         """
@@ -291,19 +297,23 @@ class OfflineVideoEval:
         # Set default data paths if not provided
         if data_path is None:
             if "mlvu" in dataset_name:
-                data_path = "/data/ms/hf_cache/MLVU"
+                #data_path = "/data/ms/hf_cache/MLVU"
+                data_path = "/video/MVLU/MLVU"
+                #data_path = "/workspace/InfiniPot-V/MLVU"
             elif "ego" in dataset_name:
                 data_path = "/data/ms/hf_cache/egoschema"
             elif "mme" in dataset_name:
                 data_path = "/data/ms/hf_cache/videomme"
             elif "lvb" in dataset_name:
                 data_path = "/data/ms/hf_cache/longvideobench"
+            elif "sample" in dataset_name:
+                data_path = "sample"
             else:
                 raise ValueError(f"Please provide data_path for dataset: {dataset_name}")
         
-        print(f"Loading dataset: {dataset_name} from {data_path}")
+        self._print(f"Loading dataset: {dataset_name} from {data_path}")
         dataset = EvalDataset(data_path=data_path, dataset=dataset_name)
-        print(f"Dataset loaded: {len(dataset)} samples")
+        self._print(f"Dataset loaded: {len(dataset)} samples")
         
         return dataset
     
@@ -344,7 +354,7 @@ class OfflineVideoEval:
         # Generate dump path for preprocessed inputs
         # Handle different video formats
         video_formats = [".mp4", ".avi", ".mov", ".mkv"]
-        dump_path = video_path.replace("/video/", "/video_sampled_qwen/")
+        dump_path = video_path.replace("/MLVU/video/", "/MLVU/video_sampled_qwen_768/")
         
         for fmt in video_formats:
             if dump_path.endswith(fmt):
@@ -354,18 +364,18 @@ class OfflineVideoEval:
         # Try to load dumped inputs if option is enabled
         if self.load_dumped and os.path.exists(dump_path):
             if is_first_sample:
-                print("Loading dumped preprocessed inputs...")
+                self._print("Loading dumped preprocessed inputs...")
             cur_time = time.time()
             inputs = torch.load(dump_path)
             inputs = inputs.to(self.model.device)
             load_time = time.time() - cur_time
             if is_first_sample:
-                print(f"Loaded dumped inputs in {load_time:.4f}s")
+                self._print(f"Loaded dumped inputs in {load_time:.4f}s")
         else:
             if self.load_dumped and is_first_sample:
-                print("No dumped file found! Processing video...")
+                self._print("No dumped file found! Processing video...")
             elif is_first_sample:
-                print("Processing video from scratch...")
+                self._print("Processing video from scratch...")
                 
             # Process vision info and prepare inputs
             _, video = process_vision_info(messages)
@@ -378,11 +388,19 @@ class OfflineVideoEval:
                 padding=True,
                 return_tensors="pt",
             )
-            inputs = inputs.to(self.model.device)
             process_time = time.time() - cur_time
             if is_first_sample:
-                print(f"Processed video in {process_time:.4f}s")
-        
+                self._print(f"Processed video in {process_time:.4f}s")
+            
+            input_ids = inputs["input_ids"]
+            if self.load_dumped:    
+                inputs["pixel_values_videos"] = inputs["pixel_values_videos"].half()
+                inputs = inputs.to("cpu")
+                os.makedirs(os.path.dirname(dump_path), exist_ok=True)
+                torch.save(inputs, dump_path)
+
+            inputs = inputs.to(self.model.device)
+            
         # Prepare input_ids with video tokens
         input_ids = self.processor.tokenizer(text, return_tensors="pt").input_ids.to(self.model.device)
         video_length = int(inputs["pixel_values_videos"].shape[0] // 4) # patch merger 
@@ -419,7 +437,10 @@ class OfflineVideoEval:
             
         elif "mlvu" in dataset_name or dataset_name == "egoschema" or "lvb" in dataset_name:
             question_text = data_item["prompt"]
-            
+        
+        elif "sample" in dataset_name:
+            question_text = data_item["questions"] + (" Respond with which option is the correct answer and explain why it is the correct answer.")
+        
         else:
             raise NotImplementedError(f"Question formatting not implemented for dataset: {dataset_name}")
         
@@ -470,6 +491,7 @@ class OfflineVideoEval:
             Generated response text
         """
         with torch.no_grad():
+            inputs.pop("second_per_grid_ts", None) ##qwen2 전용
             generated_ids = self.model.generate(**inputs, max_new_tokens=5)
             
             # Decode output (same as original code)
@@ -497,16 +519,20 @@ class OfflineVideoEval:
             tuple: (inputs_embeds, position_ids_full)
         """
         # Calculate position_ids_full and height_width
-        position_ids_full, _ = self.model.get_rope_index(input_ids, video_grid_thw=inputs["video_grid_thw"])
+        position_ids_full, _ = self.model.model.get_rope_index(input_ids, video_grid_thw=inputs["video_grid_thw"])
         self.model.config.height_width = position_ids_full[1,:,system_size:system_size+token_per_frame].max() - position_ids_full[1,:,system_size:system_size+token_per_frame].min() + 1
         
         # Get token embeddings
-        inputs_embeds = self.model.model.embed_tokens(input_ids)
+        inputs_embeds = self.model.model.get_input_embeddings()(input_ids)
         pixel_values_videos = inputs["pixel_values_videos"].type(self.model.dtype)
         
         # Visual Encoding
         with torch.inference_mode():
-            video_embeds = self.model.visual(pixel_values_videos, grid_thw=inputs["video_grid_thw"]).to(inputs_embeds.device)
+            video_embeds = self.model.get_video_features(
+                pixel_values_videos,
+                video_grid_thw=inputs["video_grid_thw"]
+            )
+            video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
         
         # Replace video tokens with visual embeddings
         video_mask = input_ids == self.model.config.video_token_id
@@ -650,7 +676,7 @@ class OfflineVideoEval:
         
         # Generation loop
         generation_finished = False
-        max_gen_tokens = 10  # Prevent infinite loop
+        max_gen_tokens = 100  # Prevent infinite loop
         gen_token_count = 0
         
         while not generation_finished and gen_token_count < max_gen_tokens:
@@ -720,7 +746,7 @@ class OfflineVideoEval:
         past_key_values = DynamicCache()
         
         # Calculate position_ids_full
-        position_ids_full, _ = self.model.get_rope_index(input_ids, video_grid_thw=inputs["video_grid_thw"])
+        position_ids_full, _ = self.model.model.get_rope_index(input_ids, video_grid_thw=inputs["video_grid_thw"])
         self.model.config.height_width = position_ids_full[1,:,system_size:system_size+token_per_frame].max() - position_ids_full[1,:,system_size:system_size+token_per_frame].min() + 1
         
         token_length = input_ids.shape[1]
@@ -781,6 +807,7 @@ class OfflineVideoEval:
             is_first_sample = (idx == 0)
             try:
                 inputs = self.prepare_video_input(video_path, question_text, is_first_sample)
+
             except Exception as e:
                 print(f"Error preparing video input: {e}")
                 continue
@@ -945,23 +972,28 @@ class OfflineVideoEval:
             json.dump(simple_results, f, indent=2)
         
         # Print summary
-        print(f"\n=== EVALUATION SUMMARY ===")
-        print(f"Dataset: {dataset_name}")
-        print(f"Overall Accuracy: {overall_accuracy:.4f} ({correct_count}/{total_count})")
+        if dataset_name == "sample":
+            print(f"\n=== Sample Generation Results ===")
+            print(f">>> QUESTION: {question_text}")
+            print(f">>> RESPONSE: {response}")
+        else:
+            print(f"\n=== EVALUATION SUMMARY ===")
+            print(f"Dataset: {dataset_name}")
+            print(f"Overall Accuracy: {overall_accuracy:.4f} ({correct_count}/{total_count})")
+            
+            if task_accuracy:
+                print(f"\nAccuracy by Task Type:")
+                for task_type, acc in task_accuracy.items():
+                    stats = task_type_stats[task_type]
+                    print(f"  {task_type}: {acc:.4f} ({stats['correct']}/{stats['total']})")
+            
+            if dataset_name == "videomme" and duration_accuracy:
+                print(f"\nAccuracy by Duration:")
+                for duration, acc in duration_accuracy.items():
+                    stats = duration_stats[duration]
+                    print(f"  {duration}: {acc:.4f} ({stats['correct']}/{stats['total']})")
         
-        if task_accuracy:
-            print(f"\nAccuracy by Task Type:")
-            for task_type, acc in task_accuracy.items():
-                stats = task_type_stats[task_type]
-                print(f"  {task_type}: {acc:.4f} ({stats['correct']}/{stats['total']})")
-        
-        if dataset_name == "videomme" and duration_accuracy:
-            print(f"\nAccuracy by Duration:")
-            for duration, acc in duration_accuracy.items():
-                stats = duration_stats[duration]
-                print(f"  {duration}: {acc:.4f} ({stats['correct']}/{stats['total']})")
-        
-        print(f"\nResults saved to: {output_path}")
+            print(f"\nResults saved to: {output_path}")
         
         return final_results
 
@@ -971,7 +1003,7 @@ def main():
     parser.add_argument("--model_path", type=str, default="Qwen/Qwen2-VL-7B-Instruct",
                         help="Path to the Qwen2VL model")
     parser.add_argument("--dataset", type=str, required=True,
-                        choices=["videomme", "mlvu", "lvb", "egoschema"],
+                        choices=["videomme", "mlvu", "lvb", "egoschema", "sample"],
                         help="Dataset to evaluate on")
     parser.add_argument("--data_path", type=str, default=None,
                         help="Path to dataset (auto-detected if not provided)")
@@ -1006,7 +1038,8 @@ def main():
                         help="Type of input compression: none (traditional), entropy, or similarity")
     parser.add_argument("--per_frame", action="store_true",
                         help="Select complete frames instead of individual tokens (for val_norm method)")
-    
+    parser.add_argument("--verbose", action="store_true",
+                        help="Verbose output")
     args = parser.parse_args()
     
     # Initialize evaluator
@@ -1021,29 +1054,31 @@ def main():
         adaptive_pooling=args.adaptive_pooling,
         load_dumped=args.load_dumped,
         input_compression=args.input_compression,
-        per_frame=args.per_frame
+        per_frame=args.per_frame,
+        verbose = args.verbose
     )
     
     # Load dataset
     dataset = evaluator.load_dataset(args.dataset, args.data_path)
     
-    print(f"Dataset: {args.dataset}")
-    print(f"Number of samples: {len(dataset)}")
-    print(f"Model: {args.model_path}")
-    print(f"Load dumped: {args.load_dumped}")
-    print(f"Block processing: {args.use_block_processing}")
-    if args.use_block_processing:
-        print(f"Block size: {args.block_size}")
-        print(f"Compress frames: {args.compress_frame_num}")
-        compression_display = {
-            "none": args.compression_method,
-            "entropy": "Entropy-based",
-            "similarity": "Similarity-based"
-        }
-        print(f"Compression method: {compression_display[args.input_compression]}")
+    if args.verbose:
+        print(f"Dataset: {args.dataset}")
+        print(f"Number of samples: {len(dataset)}")
+        print(f"Model: {args.model_path}")
+        print(f"Load dumped: {args.load_dumped}")
+        print(f"Block processing: {args.use_block_processing}")
+        if args.use_block_processing:
+            print(f"Block size: {args.block_size}")
+            print(f"Compress frames: {args.compress_frame_num}")
+            compression_display = {
+                "none": args.compression_method,
+                "entropy": "Entropy-based",
+                "similarity": "Similarity-based"
+            }
+            print(f"Compression method: {compression_display[args.input_compression]}")
+        print(f"\n=== Starting Evaluation ===")
     
     # Run evaluation
-    print(f"\n=== Starting Evaluation ===")
     results = evaluator.evaluate_dataset(
         dataset=dataset,
         dataset_name=args.dataset,

@@ -1,0 +1,15 @@
+[
+    {
+        "video": "surveil_8.mp4",
+        "duration": 223.87,
+        "question": "Is there any abnormality in this surveillance video? If so, what type of abnormality is it?",
+        "candidates": [
+            "Burglary",
+            "Fighting",
+            "Robbery",
+            "Assault"
+        ],
+        "answer": "Robbery",
+        "question_type": "anomaly_reco"
+    }
+]

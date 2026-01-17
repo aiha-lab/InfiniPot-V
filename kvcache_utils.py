@@ -1,6 +1,90 @@
 import torch
 from typing import Tuple
 
+def _get_layer_kv(pkv, layer_idx: int):
+    # 1) legacy cache: tuple/list of (k,v) per layer
+    if isinstance(pkv, (list, tuple)):
+        k, v = pkv[layer_idx][0], pkv[layer_idx][1]
+        return k, v
+
+    # 2) Cache 객체인데 legacy로 변환 가능
+    if hasattr(pkv, "to_legacy_cache"):
+        legacy = pkv.to_legacy_cache()
+        if isinstance(legacy, (list, tuple)):
+            k, v = legacy[layer_idx][0], legacy[layer_idx][1]
+            return k, v
+        # 어떤 버전은 to_legacy_cache가 캐시 객체를 반환할 수도 있음 → 계속 진행
+
+    # 3) DynamicCache 내부 저장 필드명 여러 변형 대응
+    for k_name, v_name in [
+        ("key_cache", "value_cache"),
+        ("_key_cache", "_value_cache"),
+        ("keys_cache", "values_cache"),
+        ("k_cache", "v_cache"),
+    ]:
+        if hasattr(pkv, k_name) and hasattr(pkv, v_name):
+            k_list = getattr(pkv, k_name)
+            v_list = getattr(pkv, v_name)
+            return k_list[layer_idx], v_list[layer_idx]
+
+    # 4) 레이어 객체 리스트로 보관하는 변형 대응
+    if hasattr(pkv, "layers"):
+        layer = pkv.layers[layer_idx]
+        for k_name, v_name in [("keys", "values"), ("key", "value")]:
+            if hasattr(layer, k_name) and hasattr(layer, v_name):
+                return getattr(layer, k_name), getattr(layer, v_name)
+
+    # 5) 여기까지 왔으면 API를 모르는 상태 → 디버그용 힌트
+    raise TypeError(
+        f"Unsupported past_key_values type={type(pkv)}; "
+        f"available attrs example={list(vars(pkv).keys())[:20] if hasattr(pkv,'__dict__') else 'no __dict__'}"
+    )
+
+def _set_layer_kv(pkv, layer_idx: int, new_k, new_v):
+    """
+    pkv가 어떤 형태(DynamicCache / legacy)로 오든 layer_idx의 KV를 교체한다.
+    - 가능하면 pkv를 in-place로 수정
+    - 불가능하면 (legacy_list, True)를 반환해 호출부에서 교체하도록 한다
+    """
+    # 1) legacy cache: list/tuple of (k,v)
+    if isinstance(pkv, list):
+        pkv[layer_idx] = (new_k, new_v)
+        return pkv, False
+    if isinstance(pkv, tuple):
+        tmp = list(pkv)
+        tmp[layer_idx] = (new_k, new_v)
+        return tmp, True  # tuple은 불변이라 교체 필요
+
+    # 2) DynamicCache 계열: 내부 저장 필드명 변형 대응
+    for k_name, v_name in [
+        ("key_cache", "value_cache"),
+        ("_key_cache", "_value_cache"),
+        ("keys_cache", "values_cache"),
+        ("k_cache", "v_cache"),
+    ]:
+        if hasattr(pkv, k_name) and hasattr(pkv, v_name):
+            getattr(pkv, k_name)[layer_idx] = new_k
+            getattr(pkv, v_name)[layer_idx] = new_v
+            return pkv, False
+
+    # 3) layers 기반 보관 형태 대응
+    if hasattr(pkv, "layers"):
+        layer = pkv.layers[layer_idx]
+        for k_name, v_name in [("keys", "values"), ("key", "value")]:
+            if hasattr(layer, k_name) and hasattr(layer, v_name):
+                setattr(layer, k_name, new_k)
+                setattr(layer, v_name, new_v)
+                return pkv, False
+
+    # 4) 최후의 수단: legacy로 변환 후 교체해서 반환
+    if hasattr(pkv, "to_legacy_cache"):
+        legacy = pkv.to_legacy_cache()
+        if isinstance(legacy, (list, tuple)):
+            legacy_list = list(legacy)
+            legacy_list[layer_idx] = (new_k, new_v)
+            return legacy_list, True
+
+    raise TypeError(f"Cannot set KV for type={type(pkv)} (no known storage fields).")
 
 def process_kv_cache(
     past_key_values,
@@ -39,8 +123,8 @@ def process_kv_cache(
         tuple: (compressed_past_key_values, cap_list)
     """
     
-    pooling_func_list = [2, 2, 1, -1]
-    pool_size_list = [7, 5, 3, 3]
+    pooling_func_list = [3, 2, 1, -1]
+    pool_size_list = [7, 5, 3, 1]
 
     if compress_frame_num <= 0:
         return past_key_values, None
@@ -59,21 +143,22 @@ def process_kv_cache(
         return past_key_values, None
     
     # Get key and value states for processing
-    num_layers = len(model.model.layers)
+    num_layers = len(model.model.language_model.layers)
     
     # Process each layer
     for layer_idx in range(num_layers):
 
         # Layer-Adaptive Pooling
         if adaptive_pooling:
-            idx = layer_idx // (model.config.num_hidden_layers // len(pooling_func_list))
+            num_layers = len(model.model.language_model.layers)
+            idx = layer_idx // max(1, (num_layers // len(pooling_func_list)))
+            #idx = layer_idx // (model.config.num_hidden_layers // len(pooling_func_list))
             avg_pooling_nd = pooling_func_list[idx]
             attn_pool_size = pool_size_list[idx]
         else:
             avg_pooling_nd = -1
-            
-        key_states = past_key_values.key_cache[layer_idx]
-        value_states = past_key_values.value_cache[layer_idx]
+
+        key_states, value_states = _get_layer_kv(past_key_values, layer_idx)
         bsz, num_heads, q_len, head_dim = key_states.shape
         
         # Extract vision tokens to compress
@@ -98,7 +183,7 @@ def process_kv_cache(
             all_indices = torch.tensor(selected_token_indices, device=key_states.device)
             all_indices = all_indices.unsqueeze(0).expand(num_heads, -1)
                         
-        elif method == "tar_val":
+        elif method == "infinipot-v":
             # Combined tar + Value norm approach
             attn_budget = round((1 - tar_ratio) * compress_frame_num * token_per_frame)
             
@@ -165,9 +250,37 @@ def process_kv_cache(
                 if avg_pooling_nd > 1:
                     original_numel = val_norm_score.numel()
                     val_norm_reshaped = val_norm_score.reshape(head_num, frame_num, patch_size, -1)
-                    val_norm_pooled = avg_pool(val_norm_reshaped)
-                    val_norm_score = val_norm_pooled.reshape(head_num, -1)
-                    assert original_numel == val_norm_score.numel()
+                
+                    T = val_norm_reshaped.shape[-3] 
+                    H = val_norm_reshaped.shape[-2]  
+                    W = val_norm_reshaped.shape[-1] 
+                
+                    pool_size_eff = min(pool_size, T, H, W)
+
+                    if pool_size_eff % 2 == 0:
+                        pool_size_eff -= 1
+                
+                    if pool_size_eff < 2:
+                        pass
+                    else:
+                        if pool_size_eff != pool_size:
+                            pool_size = pool_size_eff
+                            if avg_pooling_nd == 2:
+                                avg_pool = torch.nn.AvgPool2d(
+                                    kernel_size=(pool_size, pool_size),
+                                    stride=(1, 1),
+                                    padding=(pool_size // 2, pool_size // 2),
+                                )
+                            elif avg_pooling_nd == 3:
+                                avg_pool = torch.nn.AvgPool3d(
+                                    kernel_size=(pool_size, pool_size, pool_size),
+                                    stride=(1, 1, 1),
+                                    padding=(pool_size // 2, pool_size // 2, pool_size // 2),
+                                )
+                
+                        val_norm_pooled = avg_pool(val_norm_reshaped)
+                        val_norm_score = val_norm_pooled.reshape(head_num, -1)
+                        assert original_numel == val_norm_score.numel()
                 # 1D pooling
                 else:
                     val_norm_score = avg_pool(val_norm_score)
@@ -197,11 +310,9 @@ def process_kv_cache(
         new_value_states_to_compress = value_states_to_compress[batch_indices, head_indices, all_indices].unsqueeze(0)
         
         # Concatenate with system tokens
-        past_key_values.key_cache[layer_idx] = torch.cat([
-            key_states[:, :, :system_size, :], new_key_states_to_compress
-        ], dim=2)
-        past_key_values.value_cache[layer_idx] = torch.cat([
-            value_states[:, :, :system_size, :], new_value_states_to_compress
-        ], dim=2)
-    
-    return past_key_values, None 
+        new_k = torch.cat([key_states[:, :, :system_size, :], new_key_states_to_compress], dim=2)
+        new_v = torch.cat([value_states[:, :, :system_size, :], new_value_states_to_compress], dim=2)
+
+        past_key_values, need_replace = _set_layer_kv(past_key_values, layer_idx, new_k, new_v)
+
+    return past_key_values, None
