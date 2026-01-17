@@ -1,91 +1,6 @@
 import torch
 from typing import Tuple
 
-def _get_layer_kv(pkv, layer_idx: int):
-    # 1) legacy cache: tuple/list of (k,v) per layer
-    if isinstance(pkv, (list, tuple)):
-        k, v = pkv[layer_idx][0], pkv[layer_idx][1]
-        return k, v
-
-    # 2) Cache 객체인데 legacy로 변환 가능
-    if hasattr(pkv, "to_legacy_cache"):
-        legacy = pkv.to_legacy_cache()
-        if isinstance(legacy, (list, tuple)):
-            k, v = legacy[layer_idx][0], legacy[layer_idx][1]
-            return k, v
-        # 어떤 버전은 to_legacy_cache가 캐시 객체를 반환할 수도 있음 → 계속 진행
-
-    # 3) DynamicCache 내부 저장 필드명 여러 변형 대응
-    for k_name, v_name in [
-        ("key_cache", "value_cache"),
-        ("_key_cache", "_value_cache"),
-        ("keys_cache", "values_cache"),
-        ("k_cache", "v_cache"),
-    ]:
-        if hasattr(pkv, k_name) and hasattr(pkv, v_name):
-            k_list = getattr(pkv, k_name)
-            v_list = getattr(pkv, v_name)
-            return k_list[layer_idx], v_list[layer_idx]
-
-    # 4) 레이어 객체 리스트로 보관하는 변형 대응
-    if hasattr(pkv, "layers"):
-        layer = pkv.layers[layer_idx]
-        for k_name, v_name in [("keys", "values"), ("key", "value")]:
-            if hasattr(layer, k_name) and hasattr(layer, v_name):
-                return getattr(layer, k_name), getattr(layer, v_name)
-
-    # 5) 여기까지 왔으면 API를 모르는 상태 → 디버그용 힌트
-    raise TypeError(
-        f"Unsupported past_key_values type={type(pkv)}; "
-        f"available attrs example={list(vars(pkv).keys())[:20] if hasattr(pkv,'__dict__') else 'no __dict__'}"
-    )
-
-def _set_layer_kv(pkv, layer_idx: int, new_k, new_v):
-    """
-    pkv가 어떤 형태(DynamicCache / legacy)로 오든 layer_idx의 KV를 교체한다.
-    - 가능하면 pkv를 in-place로 수정
-    - 불가능하면 (legacy_list, True)를 반환해 호출부에서 교체하도록 한다
-    """
-    # 1) legacy cache: list/tuple of (k,v)
-    if isinstance(pkv, list):
-        pkv[layer_idx] = (new_k, new_v)
-        return pkv, False
-    if isinstance(pkv, tuple):
-        tmp = list(pkv)
-        tmp[layer_idx] = (new_k, new_v)
-        return tmp, True  # tuple은 불변이라 교체 필요
-
-    # 2) DynamicCache 계열: 내부 저장 필드명 변형 대응
-    for k_name, v_name in [
-        ("key_cache", "value_cache"),
-        ("_key_cache", "_value_cache"),
-        ("keys_cache", "values_cache"),
-        ("k_cache", "v_cache"),
-    ]:
-        if hasattr(pkv, k_name) and hasattr(pkv, v_name):
-            getattr(pkv, k_name)[layer_idx] = new_k
-            getattr(pkv, v_name)[layer_idx] = new_v
-            return pkv, False
-
-    # 3) layers 기반 보관 형태 대응
-    if hasattr(pkv, "layers"):
-        layer = pkv.layers[layer_idx]
-        for k_name, v_name in [("keys", "values"), ("key", "value")]:
-            if hasattr(layer, k_name) and hasattr(layer, v_name):
-                setattr(layer, k_name, new_k)
-                setattr(layer, v_name, new_v)
-                return pkv, False
-
-    # 4) 최후의 수단: legacy로 변환 후 교체해서 반환
-    if hasattr(pkv, "to_legacy_cache"):
-        legacy = pkv.to_legacy_cache()
-        if isinstance(legacy, (list, tuple)):
-            legacy_list = list(legacy)
-            legacy_list[layer_idx] = (new_k, new_v)
-            return legacy_list, True
-
-    raise TypeError(f"Cannot set KV for type={type(pkv)} (no known storage fields).")
-
 def process_kv_cache(
     past_key_values,
     model,
@@ -158,7 +73,8 @@ def process_kv_cache(
         else:
             avg_pooling_nd = -1
 
-        key_states, value_states = _get_layer_kv(past_key_values, layer_idx)
+        key_states = past_key_values.layers[layer_idx].keys
+        value_states = past_key_values.layers[layer_idx].values
         bsz, num_heads, q_len, head_dim = key_states.shape
         
         # Extract vision tokens to compress
@@ -313,6 +229,7 @@ def process_kv_cache(
         new_k = torch.cat([key_states[:, :, :system_size, :], new_key_states_to_compress], dim=2)
         new_v = torch.cat([value_states[:, :, :system_size, :], new_value_states_to_compress], dim=2)
 
-        past_key_values, need_replace = _set_layer_kv(past_key_values, layer_idx, new_k, new_v)
+        past_key_values.layers[layer_idx].keys = new_k
+        past_key_values.layers[layer_idx].values = new_v
 
     return past_key_values, None

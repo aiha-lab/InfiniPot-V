@@ -268,14 +268,14 @@ class OfflineVideoEval:
         if "2.5-vl" in self.model_path.lower():
             self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 self.model_path, 
-                torch_dtype="auto", 
+                dtype="auto", 
                 device_map="auto", 
                 attn_implementation="flash_attention_2"
             )
         else:
             self.model = Qwen2VLForConditionalGeneration.from_pretrained(
                 self.model_path, 
-                torch_dtype="auto", 
+                dtype="auto", 
                 device_map="auto", 
                 attn_implementation="flash_attention_2"
             )
@@ -676,7 +676,7 @@ class OfflineVideoEval:
         
         # Generation loop
         generation_finished = False
-        max_gen_tokens = 100  # Prevent infinite loop
+        max_gen_tokens = 300  # Prevent infinite loop
         gen_token_count = 0
         
         while not generation_finished and gen_token_count < max_gen_tokens:
@@ -1085,11 +1085,11 @@ def main():
         output_dir=args.output_dir,
         exp_tag=args.exp_tag
     )
-    
-    print(f"\n=== Evaluation Complete ===")
-    print(f"Overall Accuracy: {results['accuracy_statistics']['overall_accuracy']:.4f}")
-    print(f"Total Questions: {results['accuracy_statistics']['total_questions']}")
-    print(f"Total Correct: {results['accuracy_statistics']['total_correct']}")
+    if args.dataset != "sample":
+        print(f"\n=== Evaluation Complete ===")
+        print(f"Overall Accuracy: {results['accuracy_statistics']['overall_accuracy']:.4f}")
+        print(f"Total Questions: {results['accuracy_statistics']['total_questions']}")
+        print(f"Total Correct: {results['accuracy_statistics']['total_correct']}")
 
 
 if __name__ == "__main__":
