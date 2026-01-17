@@ -25,9 +25,8 @@ bash scripts/run_sample.sh 0  # GPU ID
 ```
 Supported Models: Qwen2-VL, Qwen2.5-VL series
 
-### Example Result
-
-**Setup**: 220-second surveillance video (~32K context length) compressed to 4K tokens using InfiniPot-V
+### Example Result (Qwen2.5-VL-7B)
+**Setup**: 220 seconds surveillance video (~32K context length) compressed to 4K tokens using InfiniPot-V
 (Sample video from [MLVU](https://huggingface.co/datasets/MLVU/MVLU): `samples/video/6_anomaly_reco/surveil_8.mp4`)
 
 **Question**: Is there any abnormality in this surveillance video? If so, what type of abnormality is it? 
@@ -35,9 +34,9 @@ Supported Models: Qwen2-VL, Qwen2.5-VL series
 
 **Answer**: Robbery
 
-**InfiniPot-4K**: The correct answer is that there is an abnormality in the surveillance video. 
+**InfiniPot-V-4K**: The correct answer is that there is an abnormality in the surveillance video. 
     The abnormality is the presence of two individuals entering the room and engaging in what 
-    appears to be a *robbery or theft*. This is abnormal because it is not typical for people 
+    appears to be a **robbery or theft**. This is abnormal because it is not typical for people 
     to enter a room and immediately start causing damage and taking items, especially in a 
     public setting like a bank.
 
