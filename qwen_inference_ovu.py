@@ -219,7 +219,7 @@ class OfflineVideoEval:
         """
         with torch.no_grad():
             inputs.pop("second_per_grid_ts", None) # for qwen2
-            generated_ids = self.model.generate(**inputs, max_new_tokens=5)
+            generated_ids = self.model.generate(**inputs, max_new_tokens=MAX_GEN_TOKENS)
             
             # Decode output (same as original code)
             generated_ids_trimmed = [
