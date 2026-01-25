@@ -4,9 +4,10 @@
   <img src="./images/fig2.png" width="800">
 </p>
 
-> **Disclaimer**: This repository is a research-purpose re-implementation for reproducing the results presented in [InfiniPot-V](https://openreview.net/forum?id=hFxOZjHyTg). It does not include all components of the full methodology described in the paper.
-
+> **Disclaimer**: This repository is a research-purpose re-implementation for reproducing the results presented in [InfiniPot-V](https://openreview.net/forum?id=hFxOZjHyTg). It does not include all components of the full methodology described in the paper.  
 ---
+
+(260125) For comparison between code output and reported number in paper, please see `accuracy.json` number in results folder (which is averaged subtask accuracy)
 
 ## Installation
 
